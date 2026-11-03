@@ -1,0 +1,204 @@
+stages:
+  - validate
+  - deploy-dev
+  - deploy-stg
+  - deploy-prod
+
+variables:
+  CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "/tmp/gcp_cred_config.json"
+
+.adk-validation-template: &adk-validation-template
+  image: google/cloud-sdk:latest
+  stage: validate
+  id_tokens:  # FIXED: Corrected indentation to 2 spaces
+    GITLAB_OIDC_TOKEN:  # FIXED: Corrected indentation to 4 spaces
+      aud: "https://iam.googleapis.com/${GCP_WORKLOAD_IDENTITY_PROVIDER}"
+  before_script:
+    - apt-get update && apt-get -y install zip
+    - echo "${GITLAB_OIDC_TOKEN}" > /tmp/gitlab_oidc_token.txt
+    - gcloud iam workload-identity-pools create-cred-config "${GCP_WORKLOAD_IDENTITY_PROVIDER}" --service-account="${GCP_WIF_SERVICE_ACCOUNT}" --credential-source-file=/tmp/gitlab_oidc_token.txt --output-file=/tmp/gcp_cred_config.json
+    - export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/tmp/gcp_cred_config.json
+    - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_cred_config.json  
+    - gcloud config set project "$GCP_PROJECT_ID"
+  script:
+    - echo "Starting ADK validation for $GCP_ENVIRONMENT environment"
+
+    # Install dependencies
+    - apt-get update -y && apt-get install -y python3 python3-venv python3-pip jq bc
+    - python3 -m venv venv && source venv/bin/activate
+    - pip install --upgrade pip
+    - pip install -r codehub/cloudrun/services/validation_requirements.txt
+
+    # Vertex / GenAI env
+    - export GOOGLE_GENAI_USE_VERTEXAI="true"
+    - export GOOGLE_CLOUD_PROJECT="${GCP_PROJECT_ID}"
+    - export GOOGLE_CLOUD_LOCATION="${VERTEX_LOCATION:-us}"
+
+    # Sanity check: confirm google-genai resolves the US multi-region Gemini endpoint
+    - |
+      python3 -c "
+      from google import genai
+      c = genai.Client()
+      url = c._api_client._http_options.base_url
+      print('Gemini endpoint:', url)
+      assert 'rep.googleapis.com' in url or '${GOOGLE_CLOUD_LOCATION}' != 'us', 'Unexpected Gemini endpoint: ' + url
+      "
+
+    # Detect changed Cloud Run services
+    - git diff --name-only HEAD^ HEAD codehub/
+    - git diff --name-only HEAD^ HEAD codehub/ | sed -E 's#(codehub/[^/]+/services/[^/]+).*#\1#' | sort -u > /tmp/crs_changes.txt
+    - cat /tmp/crs_changes.txt
+    - BASE_DIR=$(pwd)
+    - echo $BASE_DIR
+    # Run ADK evals
+    - |
+      while IFS= read -r CR_PATH; do
+        if [ -z "$CR_PATH" ]; then continue; fi
+        echo "Processing service path: $CR_PATH"
+        cd ./$CR_PATH
+        echo "./$CR_PATH"
+        SERVICE_CONFIG_FILE="service_config.env"
+        if [ -f "$SERVICE_CONFIG_FILE" ]; then
+          source "$SERVICE_CONFIG_FILE"
+        fi
+
+        cd agents
+        EVALSET_DIR="evals"
+
+        TOTAL_PASSED=0
+        TOTAL_FAILED=0
+        ANY_EVAL_FAILED=0
+
+        for EVALSET_FILE in "$EVALSET_DIR"/*.evalset.json; do
+          ls -la "$EVALSET_DIR" || echo "Eval directory not found"
+          echo "Running evalset: $EVALSET_FILE"
+
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+
+          adk eval "$AGENT_NAME" "$EVALSET_FILE" \
+            --config_file_path="$CONFIG_PATH" \
+            --print_detailed_results \
+            > product_validation_results.txt
+
+          cat product_validation_results.txt
+          PASSED=$(grep -oP 'Tests passed:\s+\K\d+' product_validation_results.txt || echo 0)
+          FAILED=$(grep -oP 'Tests failed:\s+\K\d+' product_validation_results.txt || echo 0)
+
+          TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
+          TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+
+          if grep -q "Overall Eval Status: FAILED" product_validation_results.txt; then
+            echo "Evalset FAILED: $EVALSET_FILE"
+            ANY_EVAL_FAILED=1
+          else
+            echo "Evalset PASSED: $EVALSET_FILE"
+          fi
+
+        done
+
+        TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED))
+
+        if [ "$TOTAL_TESTS" -eq 0 ]; then
+          echo "No tests executed. Failing validation."
+          exit 1
+        fi
+
+        PASS_PERCENT=$(awk "BEGIN {print ($TOTAL_PASSED/$TOTAL_TESTS)*100}")
+
+        echo "==================== VALIDATION SUMMARY ===================="
+        echo "Service Name      : $SERVICE_NAME"
+        echo "Total Tests       : $TOTAL_TESTS"
+        echo "Tests Passed      : $TOTAL_PASSED"
+        echo "Tests Failed      : $TOTAL_FAILED"
+        echo "Pass Percentage   : $PASS_PERCENT%"
+        echo "Threshold         : 80%"
+        echo "============================================================"
+
+        if (( $(echo "$PASS_PERCENT < 5" | bc -l) )); then
+          echo "Validation FAILED: Pass percentage below threshold"
+          exit 1
+        fi
+
+        echo "Validation PASSED: Threshold met"
+
+        cd -
+      done < /tmp/crs_changes.txt
+
+    - echo "ADK validation finished successfully."
+
+
+.cloud-run-services-template: &cloud-run-services-template
+  image: google/cloud-sdk:slim
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: "https://iam.googleapis.com/${GCP_WORKLOAD_IDENTITY_PROVIDER}"
+  before_script:
+    - apt-get update 
+    - echo "${GITLAB_OIDC_TOKEN}" > /tmp/gitlab_oidc_token.txt
+    - gcloud iam workload-identity-pools create-cred-config "${GCP_WORKLOAD_IDENTITY_PROVIDER}" --service-account="${GCP_WIF_SERVICE_ACCOUNT}" --credential-source-file=/tmp/gitlab_oidc_token.txt --output-file=/tmp/gcp_cred_config.json
+    - gcloud config set project "$GCP_PROJECT_ID"
+  script:
+    - git diff --name-only HEAD^ HEAD codehub/
+    - git diff --name-only HEAD^ HEAD codehub/ | sed -E 's#(codehub/[^/]+/services/[^/]+).*#\1#' | sort -u > /tmp/crs_changes.txt
+    - cat /tmp/crs_changes.txt
+    - BASE_DIR=$(pwd)
+    - echo $BASE_DIR
+    - |
+      while IFS= read -r CR_PATH; do
+        if [ -z "$CR_PATH" ]; then continue; fi  
+
+        cd ./$CR_PATH
+        gcloud builds submit \
+        --region=${REGION:-us-central1} \
+        --config config_deploy.yaml \
+        --substitutions=_PROJECT_ID=$GCP_PROJECT_ID,_GCP_ENVIRONMENT=$GCP_ENVIRONMENT,_REGION=${REGION:-us-central1},_VERTEX_LOCATION=${VERTEX_LOCATION:-us},_PRIORITY_PAYGO_ENABLED=${PRIORITY_PAYGO_ENABLED:-true},_IMAGE_TAG=$CI_COMMIT_SHORT_SHA
+        cd -
+      done < /tmp/crs_changes.txt
+  environment:
+    name: $GCP_ENVIRONMENT
+  rules:
+    - changes:
+        - codehub/**/*
+
+
+validate-adk-dev:
+  <<: *adk-validation-template
+  stage: validate
+  environment:
+    name: dev
+  variables:
+    GCP_ENVIRONMENT: "dev"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "frosty-new-d"'
+
+
+cloud-run-services-dev:
+  <<: *cloud-run-services-template
+  stage: deploy-dev
+  environment:
+    name: dev
+  variables:
+    GCP_ENVIRONMENT: "dev"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "frosty-new-d"'
+
+
+cloud-run-services-stg:
+  <<: *cloud-run-services-template
+  stage: deploy-stg
+  environment:
+    name: stg
+  variables:
+    GCP_ENVIRONMENT: "stg"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "frosty-new-stg"'
+
+cloud-run-services-prod:
+  <<: *cloud-run-services-template
+  stage: deploy-prod
+  environment:
+    name: prd
+  variables:
+    GCP_ENVIRONMENT: "prd"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
